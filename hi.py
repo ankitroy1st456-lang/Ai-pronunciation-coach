@@ -1,26 +1,36 @@
 import streamlit as st
 import torch
-from transformers import pipeline
+from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
 import soundfile as sf
 from io import BytesIO
 import string
 import difflib
 from gtts import gTTS
 import random
+from PIL import Image
 
-# Set up page layout
+# Set up the website page layout
 st.set_page_config(page_title="AI Pronunciation Coach", layout="wide")
 st.title("AI Pronunciation Coach")
 
-# Load lightweight speech recognition model
+# Load the speech-to-text AI model (Whisper)
 @st.cache_resource
-def load_model():
+def get_speech_model():
     return pipeline("automatic-speech-recognition", model="openai/whisper-tiny.en", device="cpu")
 
-model = load_model()
+speech_ai = get_speech_model()
 
-# Practice sentences grouped by level
-POOLS = {
+# Load the image captioning AI model (BLIP)
+@st.cache_resource
+def get_image_ai():
+    model_name = "Salesforce/blip-image-captioning-base"
+    processor = BlipProcessor.from_pretrained(model_name)
+    model = BlipForConditionalGeneration.from_pretrained(model_name)
+    return processor, model
+
+image_processor, image_ai = get_image_ai()
+# Sentences for users to practice, split by difficulty levels
+SENTENCE_LEVELS = {
     1: [
         "The cat sat on the mat.",
         "Dogs love to run.",
@@ -50,163 +60,228 @@ POOLS = {
     ]
 }
 
-# Initialize session state variables
-if "input_key" not in st.session_state:
-    st.session_state.input_key = 0
-if "level" not in st.session_state:
-    st.session_state.level = 1
-if "text" not in st.session_state:
-    st.session_state.text = random.choice(POOLS[st.session_state.level])
-if "results" not in st.session_state:
-    st.session_state.results = None
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "mode" not in st.session_state:
-    st.session_state.mode = "Challenge Pool"
+# Create memory variables so the app remembers your data when the page refreshes
+if "recorder_id" not in st.session_state:
+    st.session_state.recorder_id = 0
+if "user_level" not in st.session_state:
+    st.session_state.user_level = 1
+if "current_sentence" not in st.session_state:
+    st.session_state.current_sentence = random.choice(SENTENCE_LEVELS[st.session_state.user_level])
+if "score_results" not in st.session_state:
+    st.session_state.score_results = None
+if "score_history" not in st.session_state:
+    st.session_state.score_history = []
+if "practice_mode" not in st.session_state:
+    st.session_state.practice_mode = "Challenge Pool"
+if "saved_custom_text" not in st.session_state:
+    st.session_state.saved_custom_text = ""
+if "saved_image_bytes" not in st.session_state:
+    st.session_state.saved_image_bytes = None
 
-# Toggle between challenge sentences and custom entry
-st.session_state.mode = st.radio("Choose Practice Mode:", ["Challenge Pool", "Custom Text"], horizontal=True)
+# What happens when a user switches practice modes
+def handle_mode_change():
+    if st.session_state.practice_mode == "Custom Text":
+        st.session_state.current_sentence = st.session_state.saved_custom_text
+    elif st.session_state.practice_mode == "Challenge Pool":
+        st.session_state.current_sentence = random.choice(SENTENCE_LEVELS[st.session_state.user_level])
+    elif st.session_state.practice_mode == "Image Caption":
+        st.session_state.current_sentence = ""
+        st.session_state.saved_image_bytes = None # Clear old image
+    st.session_state.score_results = None
 
-# Set the active practice text based on mode
-if st.session_state.mode == "Challenge Pool":
-    st.write(f"**Current Level:** {st.session_state.level}")
-    st.info(st.session_state.text)
-else:
-    custom_text = st.text_input("Type your own sentence here:", "").strip()
-    st.session_state.text = custom_text
+# What happens when a user types in their own text
+def handle_custom_text_change():
+    st.session_state.current_sentence = st.session_state.saved_custom_text
+    st.session_state.score_results = None
 
-# Process audio input if text is present
-if st.session_state.text:
-    # Generate and play reference audio guide
-    tts = gTTS(text=st.session_state.text, lang="en")
-    tts_bytes = BytesIO()
-    tts.write_to_fp(tts_bytes)
-    tts_bytes.seek(0)
-    st.audio(tts_bytes.read(), format="audio/mp3")
+# Show the practice mode choice buttons
+st.radio(
+    "Choose Practice Mode:",
+    ["Challenge Pool", "Custom Text", "Image Caption"],
+    horizontal=True,
+    key="practice_mode",
+    on_change=handle_mode_change,
+)
 
-    # Audio recorder linked to session key for dynamic resets
-    audio = st.audio_input("Record your voice", key=f"audio_recorder_{st.session_state.input_key}")
+# Render the layout based on the chosen mode
+if st.session_state.practice_mode == "Challenge Pool":
+    st.write(f"**Current Level:** {st.session_state.user_level}")
+    st.info(st.session_state.current_sentence)
 
-    # Remove capitalization and punctuation for scoring
-    def clean(word):
-        return word.lower().translate(str.maketrans("", "", string.punctuation))
+elif st.session_state.practice_mode == "Custom Text":
+    st.text_input(
+        "Type your own sentence here and press enter :",
+        key="saved_custom_text",
+        on_change=handle_custom_text_change,
+    )
 
-    if audio is not None:
-        if st.button("Analyze"):
-            # Measure recording duration
-            raw_audio_bytes = audio.read()
-            audio_bytes = BytesIO(raw_audio_bytes)
-            data, rate = sf.read(audio_bytes)
-            audio_duration = len(data) / rate
-            
-            # Reject files longer than 10 seconds
-            if audio_duration > 10.0:
-                st.error(f"⚠️ Recording too long ({audio_duration:.1f}s). Please keep it under 10 seconds.")
-                st.session_state.results = None
-                st.session_state.input_key += 1
-                st.button("🔄 Try Again")
+elif st.session_state.practice_mode == "Image Caption":
+    uploaded_file = st.file_uploader("Upload an image to generate a practice sentence:", type=["png", "jpg", "jpeg"])
+
+    if uploaded_file is not None:
+        st.session_state.saved_image_bytes = uploaded_file.getvalue()
+
+    if st.session_state.saved_image_bytes is not None:
+        pil_image = Image.open(BytesIO(st.session_state.saved_image_bytes)).convert("RGB")
+        st.image(pil_image, caption="Uploaded Image", width=350)
+
+        if st.button("Generate Caption"):
+            with st.spinner("Creating a sentence from your image..."):
+                inputs = image_processor(images=pil_image, return_tensors="pt")
+                with torch.no_grad():
+                    generated_ids = image_ai.generate(**inputs, max_new_tokens=30)
+                caption_text = image_processor.decode(generated_ids[0], skip_special_tokens=True)
+                
+                # Make it look like a neat sentence
+                caption_text = caption_text.strip()
+                if caption_text:
+                    caption_text = caption_text.capitalize()
+                    if not caption_text.endswith((".", "!", "?")):
+                        caption_text += "."
+
+            if caption_text:
+                st.session_state.current_sentence = caption_text
+                st.session_state.score_results = None
+                st.success(f"**Generated Caption:** {st.session_state.current_sentence}")
+                st.rerun()
             else:
-                # Transcribe spoken audio
-                with st.spinner("Processing..."):
-                    result = model({"raw": data, "sampling_rate": rate})
-                    spoken = result["text"].strip()
+                st.error("❌ Could not generate a caption for this image.")
+    else:
+        st.session_state.current_sentence = ""
+        st.warning("Please upload an image file to begin.")
+# Only show the audio tools if there is a sentence ready to practice
+if st.session_state.current_sentence.strip():
+    # Make a computer-generated voice example for the user to listen to
+    text_to_speech = gTTS(text=st.session_state.current_sentence, lang="en")
+    speech_bytes = BytesIO()
+    text_to_speech.write_to_fp(speech_bytes)
+    speech_bytes.seek(0)
+    st.audio(speech_bytes.read(), format="audio/mp3")
+
+    # The audio recorder input box (uses a dynamic ID to clear out old recordings)
+    recorded_audio = st.audio_input("Record your voice", key=f"mic_{st.session_state.recorder_id}")
+
+    # Helper function to remove punctuation and uppercase letters for fair grading
+    def clean_word(text):
+        return text.lower().translate(str.maketrans("", "", string.punctuation))
+
+    if recorded_audio is not None:
+        if st.button("Analyze", type="primary"):
+            # Check how long the audio clip is
+            raw_bytes = recorded_audio.read()
+            audio_stream = BytesIO(raw_bytes)
+            audio_data, sample_rate = sf.read(audio_stream)
+            seconds = len(audio_data) / sample_rate
+            
+            # Stop if the user recorded for more than 10 seconds
+            if seconds > 10.0:
+                st.error(f"⚠️ Recording too long ({seconds:.1f}s). Please keep it under 10 seconds.")
+                st.session_state.score_results = None
+                st.session_state.recorder_id += 1
+                st.rerun()
+            else:
+                # Turn the user's spoken audio into text strings
+                with st.spinner("Listening to your voice..."):
+                    ai_transcription = speech_ai({"raw": audio_data, "sampling_rate": sample_rate})
+                    heard_text = ai_transcription["text"].strip()
                 
-                # Tokenize strings into word arrays
-                target_words = st.session_state.text.split()
-                spoken_words = spoken.split()
+                # Split sentences into lists of single words
+                target_word_list = st.session_state.current_sentence.split()
+                heard_word_list = heard_text.split()
                 
-                clean_target = [clean(w) for w in target_words]
-                clean_spoken = [clean(w) for w in spoken_words]
+                clean_targets = [clean_word(w) for w in target_word_list]
+                clean_heard = [clean_word(w) for w in heard_word_list]
                 
-                # Compare arrays word by word
-                matcher = difflib.SequenceMatcher(None, clean_target, clean_spoken)
-                output = [""] * len(target_words)
-                correct = 0
+                # Match the words to see which ones are correct
+                word_matcher = difflib.SequenceMatcher(None, clean_targets, clean_heard)
+                styled_output_list = [""] * len(target_word_list)
+                correct_count = 0
                 
-                # Apply visual styling flags based on matching results
-                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                    for idx in range(i1, i2):
-                        word = target_words[idx]
+                # Highlight correct words in green and wrong words in crossed-out red
+                for tag, target_start, target_end, heard_start, heard_end in word_matcher.get_opcodes():
+                    for index in range(target_start, target_end):
+                        word = target_word_list[index]
                         if tag == 'equal':
-                            output[idx] = f"<span style='color:green; font-weight:bold;'>{word}</span>"
-                            correct += 1
+                            styled_output_list[index] = f"<span style='color:green; font-weight:bold;'>{word}</span>"
+                            correct_count += 1
                         else:
-                            output[idx] = f"<span style='color:red; text-decoration:line-through;'>{word}</span>"
+                            styled_output_list[index] = f"<span style='color:red; text-decoration:line-through;'>{word}</span>"
                 
-                # Calculate accuracy score
-                score = (correct / len(target_words)) * 100
-                st.session_state.history.append(score)
+                # Calculate the percentage accuracy score
+                final_score = (correct_count / len(target_word_list)) * 100
+                st.session_state.score_history.append(final_score)
                 
-                # Set evaluation state results (includes raw transcript and raw audio bytes)
-                st.session_state.results = {
-                    "score": score,
-                    "spoken": spoken,
-                    "html": " ".join(output),
-                    "user_audio": raw_audio_bytes,
-                    "level_up": score >= 85.0 and st.session_state.level < 3 and st.session_state.mode == "Challenge Pool",
-                    "level_down": score < 60.0 and st.session_state.level > 1 and st.session_state.mode == "Challenge Pool"
+                # Check if the user qualifies to level up or down
+                should_level_up = final_score >= 85.0 and st.session_state.user_level < 3 and st.session_state.practice_mode == "Challenge Pool"
+                should_level_down = final_score < 60.0 and st.session_state.user_level > 1 and st.session_state.practice_mode == "Challenge Pool"
+                
+                # Pack the calculations together into session memory
+                st.session_state.score_results = {
+                    "percentage": final_score,
+                    "transcript": heard_text,
+                    "html_markup": " ".join(styled_output_list),
+                    "playback_bytes": raw_bytes,
+                    "level_up": should_level_up,
+                    "level_down": should_level_down
                 }
                 
-                # Change user level criteria dynamically
-                if st.session_state.results["level_up"]:
-                    st.session_state.level += 1
-                elif st.session_state.results["level_down"]:
-                    st.session_state.level -= 1
+                # Change levels based on the results flags
+                if should_level_up:
+                    st.session_state.user_level += 1
+                elif should_level_down:
+                    st.session_state.user_level -= 1
 
-                # Advance key to force audio clearing and refresh layout
-                st.session_state.input_key += 1
+                # Update recorder ID to clear out the microphone slot, then refresh page layout
+                st.session_state.recorder_id += 1
                 st.rerun()
             
 else:
-    st.session_state.results = None
-    st.warning("Please type a valid phrase in the custom text input box before recording.")
+    st.session_state.score_results = None
 
-# Render layout panels side-by-side
-if st.session_state.results is not None or st.session_state.history:
+
+# Show performance results panel if data exists
+if st.session_state.score_results is not None or st.session_state.score_history:
     st.write("---")
-    main_col1, main_col2 = st.columns(2, gap="large")
+    left_column, right_column = st.columns(2, gap="large")
     
-    # Left column: Evaluation text feedback elements
-    with main_col1:
-        if st.session_state.results is not None:
-            res = st.session_state.results
+    # Left side panel: Word scoring analysis
+    with left_column:
+        if st.session_state.score_results is not None:
+            results_data = st.session_state.score_results
             st.subheader("📊 Performance Analysis")
-            st.metric(label="Accuracy", value=f"{res['score']:.1f}%")
+            st.metric(label="Accuracy", value=f"{results_data['percentage']:.1f}%")
             
-            # Displays the exact text generated by the STT model
-            st.write(f"**What the AI Heard:** \"{res['spoken']}\"")
-            st.markdown(f"**Word Comparison:** {res['html']}", unsafe_allow_html=True)
+            st.write(f"**What the AI Heard:** \"{results_data['transcript']}\"")
+            st.markdown(f"**Word Comparison:** {results_data['html_markup']}", unsafe_allow_html=True)
             
-            # Adds playback option to hear what you recorded
             st.write("**Listen to your recording:**")
-            st.audio(res["user_audio"], format="audio/wav")
+            st.audio(results_data["playback_bytes"], format="audio/wav")
             
-            if res["level_up"]:
+            if results_data["level_up"]:
                 st.success("Level up! Great work.")
-            elif res["level_down"]:
+            elif results_data["level_down"]:
                 st.error("Lowering difficulty to practice basic phrases.")
 
-    # Right column: Score trend tracking graph
-    with main_col2:
-        if st.session_state.history:
+    # Right side panel: History progress tracking graph
+    with right_column:
+        if st.session_state.score_history:
             st.subheader("📈 Progress History")
-            st.line_chart(st.session_state.history)
+            st.line_chart(st.session_state.score_history)
 
-# Load a new sentence challenge
-def next_phrase():
-    st.session_state.text = random.choice(POOLS[st.session_state.level])
-    st.session_state.results = None
+# Button functions to handle skipping or retrying items
+def load_next_sentence():
+    st.session_state.current_sentence = random.choice(SENTENCE_LEVELS[st.session_state.user_level])
+    st.session_state.score_results = None
 
-# Clear previous metrics for another attempt
-def retry_phrase():
-    st.session_state.results = None
+def clear_current_metrics():
+    st.session_state.score_results = None
 
-# Render navigation buttons based on current mode
-if st.session_state.mode == "Challenge Pool":
-    nav_col1, nav_col2 = st.columns(2)
-    with nav_col1:
-        st.button("🔄 Try Same Sentence Again", on_click=retry_phrase)
-    with nav_col2:
-        st.button("➡️ Move to Next Challenge", on_click=next_phrase)
+# Show action buttons based on the user's active screen
+if st.session_state.practice_mode == "Challenge Pool":
+    button_col1, button_col2 = st.columns(2)
+    with button_col1:
+        st.button("🔄 Try Same Sentence Again", on_click=clear_current_metrics, use_container_width=True)
+    with button_col2:
+        st.button("➡️ Move to Next Challenge", on_click=load_next_sentence, use_container_width=True)
 else:
-    st.button("🔄 Reset This Attempt", on_click=retry_phrase)
+    st.button("🔄 Reset This Attempt", on_click=clear_current_metrics, use_container_width=True)
